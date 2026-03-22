@@ -1,381 +1,327 @@
-/*
-  ============================================================
-  Teensy 4.1 Solenoid Voltage Logger
-  ============================================================
-
-  PURPOSE:
-  --------
-  This program reads an analog voltage signal (for example,
-  from a solenoid measurement circuit), converts the raw ADC
-  reading into an actual voltage, and saves the data to a file
-  on the Teensy 4.1's microSD card.
-
-  WHAT GETS SAVED:
-  ----------------
-  Each line in the file contains:
-    time_in_microseconds, raw_adc_value, measured_voltage, actual_voltage
-
-  Example:
-    0,512,1.6500,3.3000
-    1000,520,1.6758,3.3516
-    2000,509,1.6426,3.2852
-
-  IMPORTANT HARDWARE NOTES:
-  -------------------------
-  1. The Teensy analog input pin must NEVER see more than 3.3V.
-     If your solenoid signal can go above 3.3V, you MUST use
-     a voltage divider or some other signal conditioning circuit.
-
-  2. "PWM pins" are normally used for OUTPUT, not for reading voltage.
-     To measure voltage, use an ANALOG INPUT pin.
-
-  3. Teensy 4.1 has a built-in microSD slot. This code logs to that.
-
-  4. This code assumes the signal reaching the Teensy analog pin is
-     between 0V and 3.3V.
-
-  5. If the original signal is larger than what the Teensy sees
-     because of a voltage divider, use the SIGNAL_SCALE_FACTOR
-     below to reconstruct the true original voltage.
-
-  EXAMPLE:
-  --------
-  If your real signal is divided in half before entering the Teensy,
-  then:
-      Teensy measures 2.0V
-      actual signal is 4.0V
-
-  In that case:
-      SIGNAL_SCALE_FACTOR = 2.0
-
-  AUTHOR NOTE:
-  ------------
-  This is written with very thorough comments for someone with
-  limited programming experience.
-*/
-
-#include <Arduino.h>
-#include <SD.h>
-#include <SPI.h>
-
 // ============================================================
-// USER SETTINGS
+// Teensy 4.1 Solenoid Voltage Logger
+// ============================================================
+//
+// PURPOSE:
+// This program reads an analog voltage signal (for example,
+// from a solenoid measurement circuit), converts the raw ADC
+// reading into a voltage, and saves the data to a CSV file
+// on the Teensy 4.1's built-in microSD card.
+//
+// CSV FORMAT:
+// time_us, raw_adc, measured_voltage_V, actual_voltage_V
+//
+// Example row:
+// 0,512,1.6500,3.3000
+//
+// NOTES:
+// - The Teensy analog input pin should only see 0 to 3.3 V.
+// - If the real signal is larger, use scaling hardware
+//   (like a voltage divider) and adjust SIGNAL_SCALE_FACTOR.
 // ============================================================
 
-// Analog input pin used to read the signal.
-// Choose a valid Teensy 4.1 analog pin.
-// A0 is a common choice.
+#include <Arduino.h>   // Core Arduino functions like setup(), loop(), Serial, analogRead()
+#include <SD.h>        // SD card file access
+#include <SPI.h>       // SPI communication (used by SD library internally)
+
+
+// ------------------------------------------------------------
+// Configuration
+// ------------------------------------------------------------
+
+// Analog input pin where the signal is connected.
+// A0 is a common analog input pin on Teensy boards.
 const int ANALOG_PIN = A0;
 
-// Desired sampling interval in microseconds.
-// 1000 microseconds = 1 millisecond = 1000 samples/second.
+// Time between samples, in microseconds.
+// 1000 us = 1 ms = 1000 samples per second.
 const unsigned long SAMPLE_INTERVAL_US = 1000;
 
-// The ADC reference voltage for Teensy analog input.
-// Teensy 4.1 analog inputs are generally 0.0V to 3.3V.
+// Reference voltage for the ADC.
+// Teensy 4.1 analog inputs typically measure from 0 to 3.3 V.
 const float ADC_REFERENCE_VOLTAGE = 3.3f;
 
-// ADC maximum count value.
-// For 10-bit resolution: values go from 0 to 1023.
+// Maximum ADC value for 10-bit resolution.
+// Since 10-bit ADC gives values from 0 to 1023:
 const int ADC_MAX_COUNT = 1023;
 
-// Signal scaling factor.
-// Use 1.0 if the signal at the Teensy pin is the actual signal.
-// Use 2.0 if a voltage divider cut the signal in half.
-// Use whatever matches your circuit.
+// Scaling factor used to reconstruct the actual signal voltage.
+// Example:
+// If the signal is divided by 2 before entering the Teensy,
+// then set this to 2.0 so the program reports the original voltage.
+//
+// If the Teensy reads the true voltage directly, keep this at 1.0.
 const float SIGNAL_SCALE_FACTOR = 1.0f;
 
-// File name for the data log on the SD card.
-// NOTE: 8.3 filename format is safest for SD libraries.
-// Good examples: DATA001.CSV, TEST.CSV, LOG1.TXT
+// Name of the file on the microSD card.
+// CSV format is useful because it opens easily in Excel, MATLAB, Python, etc.
 const char *LOG_FILE_NAME = "SOLENOID.CSV";
 
-// If true, data also prints to the Serial Monitor for debugging.
+// If true, each logged sample is also printed to the Serial Monitor.
+// Useful for debugging, but can slow things down at high sample rates.
 const bool PRINT_TO_SERIAL = true;
 
-// If true, flush the file after every sample.
-// This is safer if power is lost suddenly, but slower.
-// For fast logging, false is better.
-// For safer logging, true is better.
+// If true, the file is flushed after every sample.
+// This is safer if power is lost suddenly, but it makes logging slower.
+// If false, the file is flushed every 100 samples instead.
 const bool FLUSH_EVERY_SAMPLE = false;
 
-// ============================================================
-// GLOBAL VARIABLES
-// ============================================================
 
-// File object used by the SD library.
+// ------------------------------------------------------------
+// Global State
+// ------------------------------------------------------------
+
+// File object representing the open SD card file.
 File logFile;
 
-// Stores the time when the next sample should be taken.
+// Tracks when the next sample should be taken.
 unsigned long nextSampleTimeUs = 0;
 
-// Stores the time at which logging started.
-// This lets us save elapsed time instead of absolute micros().
+// Stores the time when logging began.
+// This allows us to log elapsed time instead of absolute micros().
 unsigned long startTimeUs = 0;
 
-// Count how many samples have been collected.
+// Counts how many samples have been collected.
 unsigned long sampleCount = 0;
 
-// ============================================================
-// FUNCTION DECLARATIONS
-// ============================================================
 
+// ------------------------------------------------------------
+// Function Declarations
+// ------------------------------------------------------------
+
+// Initializes the SD card hardware.
 bool initializeSDCard();
+
+// Opens the output CSV file on the SD card.
 bool openLogFile();
+
+// Writes the CSV header row to the file.
 void writeHeader();
+
+// Takes one sample and writes it to the file.
 void logOneSample();
+
+// Converts raw ADC count (0–1023) into measured voltage at the Teensy pin.
 float convertADCToMeasuredVoltage(int rawADC);
+
+// Applies the scaling factor to estimate the true voltage of the original signal.
 float convertMeasuredToActualVoltage(float measuredVoltage);
 
-// ============================================================
-// SETUP
-// ============================================================
+
+// ------------------------------------------------------------
+// Setup
+// ------------------------------------------------------------
 
 void setup()
 {
-  // Start serial communication so we can print messages
-  // to the Serial Monitor in Arduino IDE.
+  // Start Serial communication so messages can be viewed
+  // in the Arduino IDE Serial Monitor.
   Serial.begin(115200);
 
-  // Small delay so the Serial Monitor has time to connect.
+  // Short delay to give the Serial Monitor time to connect.
   delay(1500);
 
-  Serial.println();
-  Serial.println("==========================================");
-  Serial.println("Teensy 4.1 Solenoid Voltage Logger Starting");
-  Serial.println("==========================================");
+  Serial.println("\n=== Solenoid Logger Starting ===");
 
-  // Set analog read resolution.
-  // 10-bit means analogRead() returns values from 0 to 1023.
-  // This matches ADC_MAX_COUNT above.
+  // Set analogRead() to 10-bit resolution.
+  // This means analogRead() returns values between 0 and 1023.
   analogReadResolution(10);
 
-  // Optional: improve analog averaging to reduce noise.
-  // Higher numbers reduce noise but can slow reading slightly.
-  // Acceptable values commonly include 1, 4, 8, 16, 32.
+  // Average multiple ADC readings together to reduce noise.
+  // Higher averaging can make readings cleaner, but slightly slower.
   analogReadAveraging(4);
 
-  // The analog pin is an input.
+  // Set the analog pin as an input.
   pinMode(ANALOG_PIN, INPUT);
 
-  // Initialize the microSD card.
+  // Initialize the built-in SD card.
   if (!initializeSDCard())
   {
-    Serial.println("ERROR: SD card initialization failed.");
-    Serial.println("Logging cannot continue.");
-    while (true)
-    {
-      // Stop here forever if SD card setup fails.
-      delay(1000);
-    }
+    Serial.println("SD init failed. Stopping.");
+
+    // Stop forever if the SD card cannot be initialized.
+    while (true) delay(1000);
   }
 
-  // Open the output file.
+  // Open the output log file.
   if (!openLogFile())
   {
-    Serial.println("ERROR: Could not open log file.");
-    Serial.println("Logging cannot continue.");
-    while (true)
-    {
-      delay(1000);
-    }
+    Serial.println("File open failed. Stopping.");
+
+    // Stop forever if the file cannot be opened.
+    while (true) delay(1000);
   }
 
-  // Write a CSV header so the file is easy to import
-  // into Excel, MATLAB, Python, etc.
+  // Write the CSV header row.
   writeHeader();
 
-  // Save the start time.
+  // Record the start time.
   startTimeUs = micros();
 
-  // Schedule the first sample.
+  // Schedule the first sample immediately.
   nextSampleTimeUs = startTimeUs;
 
-  Serial.println("Logging started successfully.");
-  Serial.print("Sampling interval (us): ");
-  Serial.println(SAMPLE_INTERVAL_US);
-  Serial.print("Log file: ");
-  Serial.println(LOG_FILE_NAME);
-  Serial.println();
+  Serial.println("Logging started.\n");
 }
 
-// ============================================================
-// MAIN LOOP
-// ============================================================
+
+// ------------------------------------------------------------
+// Main Loop
+// ------------------------------------------------------------
 
 void loop()
 {
-  // Get the current time in microseconds.
-  unsigned long currentTimeUs = micros();
+  // Current time in microseconds since the board started running.
+  unsigned long now = micros();
 
-  // Check if it is time to take the next sample.
+  // Check whether it's time to take the next sample.
   //
-  // We use signed subtraction to handle micros() rollover safely.
-  if ((long)(currentTimeUs - nextSampleTimeUs) >= 0)
+  // This signed subtraction trick is commonly used so the code
+  // still works correctly even when micros() eventually rolls over.
+  if ((long)(now - nextSampleTimeUs) >= 0)
   {
+    // Take and store one sample.
     logOneSample();
 
     // Schedule the next sample.
-    // Using += keeps the timing more regular than using
-    // nextSampleTimeUs = micros() each time.
+    // Using += keeps the timing more regular than resetting from micros().
     nextSampleTimeUs += SAMPLE_INTERVAL_US;
   }
-
-  // The loop runs continuously.
-  // Most of the time it simply waits until the next sample time.
 }
 
-// ============================================================
-// INITIALIZE SD CARD
-// ============================================================
+
+// ------------------------------------------------------------
+// SD Card Handling
+// ------------------------------------------------------------
 
 bool initializeSDCard()
 {
-  Serial.println("Initializing SD card...");
+  Serial.println("Initializing SD...");
 
-  // BUILTIN_SDCARD is the correct chip select option for the
-  // Teensy 4.1 built-in microSD card slot.
-  if (!SD.begin(BUILTIN_SDCARD))
-  {
-    return false;
-  }
+  // BUILTIN_SDCARD is the proper option for Teensy 4.1's
+  // built-in microSD slot.
+  if (!SD.begin(BUILTIN_SDCARD)) return false;
 
-  Serial.println("SD card initialized successfully.");
+  Serial.println("SD ready.");
   return true;
 }
-
-// ============================================================
-// OPEN LOG FILE
-// ============================================================
 
 bool openLogFile()
 {
-  Serial.println("Opening log file...");
+  Serial.println("Opening file...");
 
   // FILE_WRITE opens the file for writing.
-  // If the file does not exist, it is created.
-  // If it already exists, data is appended to the end.
+  // If the file already exists, new data is appended at the end.
+  // If it does not exist, the file is created.
   logFile = SD.open(LOG_FILE_NAME, FILE_WRITE);
 
-  if (!logFile)
-  {
-    return false;
-  }
+  if (!logFile) return false;
 
-  Serial.println("Log file opened successfully.");
+  Serial.println("File ready.");
   return true;
 }
 
-// ============================================================
-// WRITE CSV HEADER
-// ============================================================
+
+// ------------------------------------------------------------
+// Logging
+// ------------------------------------------------------------
 
 void writeHeader()
 {
-  // Add a blank line to visually separate runs if data is appended.
+  // Add a blank line between logging runs in case data is appended
+  // to an existing file from a previous test.
   logFile.println();
-  logFile.println("==========================================");
-  logFile.println("New Logging Session");
+
+  // Simple session marker for readability.
+  logFile.println("=== New Session ===");
+
+  // CSV column headers.
   logFile.println("time_us,raw_adc,measured_voltage_V,actual_voltage_V");
+
+  // Immediately write the header to the card.
   logFile.flush();
 
+  // Optionally print the header to the Serial Monitor too.
   if (PRINT_TO_SERIAL)
   {
     Serial.println("time_us,raw_adc,measured_voltage_V,actual_voltage_V");
   }
 }
 
-// ============================================================
-// TAKE ONE SAMPLE AND SAVE IT
-// ============================================================
-
 void logOneSample()
 {
-  // Read the analog pin.
-  // This returns an integer from 0 to 1023 because we set
-  // analogReadResolution(10).
+  // Read the analog input pin.
+  // Since resolution is 10-bit, the result is from 0 to 1023.
   int rawADC = analogRead(ANALOG_PIN);
 
-  // Compute elapsed time since logging began.
-  unsigned long elapsedTimeUs = micros() - startTimeUs;
+  // Compute how much time has passed since logging started.
+  unsigned long elapsed = micros() - startTimeUs;
 
-  // Convert raw ADC reading to the voltage actually seen
-  // at the Teensy pin.
-  float measuredVoltage = convertADCToMeasuredVoltage(rawADC);
+  // Convert the raw ADC count to the voltage seen by the Teensy pin.
+  float measured = convertADCToMeasuredVoltage(rawADC);
 
-  // Convert that measured voltage to the "actual" signal voltage,
-  // using the user-defined scaling factor.
-  float actualVoltage = convertMeasuredToActualVoltage(measuredVoltage);
+  // Scale the measured voltage back to the estimated real signal voltage.
+  float actual = convertMeasuredToActualVoltage(measured);
 
-  // Write one CSV line to the SD card.
-  //
-  // Format:
-  // time_us,raw_adc,measured_voltage_V,actual_voltage_V
-  logFile.print(elapsedTimeUs);
+  // Write one line to the CSV file.
+  logFile.print(elapsed);
   logFile.print(",");
   logFile.print(rawADC);
   logFile.print(",");
-  logFile.print(measuredVoltage, 4); // print with 4 decimal places
+  logFile.print(measured, 4);
   logFile.print(",");
-  logFile.println(actualVoltage, 4);
+  logFile.println(actual, 4);
 
-  // Optionally print to Serial Monitor too.
+  // Optionally print the same line to the Serial Monitor.
   if (PRINT_TO_SERIAL)
   {
-    Serial.print(elapsedTimeUs);
-    Serial.print(",");
-    Serial.print(rawADC);
-    Serial.print(",");
-    Serial.print(measuredVoltage, 4);
-    Serial.print(",");
-    Serial.println(actualVoltage, 4);
+    Serial.print(elapsed); Serial.print(",");
+    Serial.print(rawADC); Serial.print(",");
+    Serial.print(measured, 4); Serial.print(",");
+    Serial.println(actual, 4);
   }
 
-  // Optionally flush every sample.
-  // Flushing forces data to be physically written to the SD card.
-  // This is safer, but slower.
+  // If enabled, force every sample to be written to the SD card immediately.
   if (FLUSH_EVERY_SAMPLE)
   {
     logFile.flush();
   }
 
+  // Increase the sample counter.
   sampleCount++;
 
-  // Periodically flush anyway, even if FLUSH_EVERY_SAMPLE is false.
-  // This balances speed and safety.
+  // If not flushing every sample, flush every 100 samples instead.
+  // This improves speed while still periodically protecting data.
   if (!FLUSH_EVERY_SAMPLE && (sampleCount % 100 == 0))
   {
     logFile.flush();
   }
 }
 
-// ============================================================
-// CONVERT RAW ADC TO MEASURED VOLTAGE
-// ============================================================
+
+// ------------------------------------------------------------
+// Conversions
+// ------------------------------------------------------------
 
 float convertADCToMeasuredVoltage(int rawADC)
 {
-  // Formula:
-  // measuredVoltage = (rawADC / ADC_MAX_COUNT) * ADC_REFERENCE_VOLTAGE
+  // Converts ADC count to voltage:
+  //
+  // measured voltage = (raw ADC / max ADC count) * reference voltage
   //
   // Example:
   // rawADC = 512
-  // measuredVoltage = (512 / 1023) * 3.3 ≈ 1.65V
-  return ((float)rawADC / (float)ADC_MAX_COUNT) * ADC_REFERENCE_VOLTAGE;
+  // measured = (512 / 1023) * 3.3 ≈ 1.65 V
+  return ((float)rawADC / ADC_MAX_COUNT) * ADC_REFERENCE_VOLTAGE;
 }
-
-// ============================================================
-// CONVERT MEASURED VOLTAGE TO ACTUAL VOLTAGE
-// ============================================================
 
 float convertMeasuredToActualVoltage(float measuredVoltage)
 {
-  // If the signal was scaled before entering the Teensy,
-  // reconstruct the original voltage here.
+  // Applies the scaling factor to reconstruct the original signal voltage.
   //
   // Example:
-  // Teensy measures 1.65V
-  // divider ratio is 2:1
-  // actual signal = 1.65 * 2 = 3.30V
+  // measuredVoltage = 1.65 V
+  // SIGNAL_SCALE_FACTOR = 2.0
+  // actual = 3.30 V
   return measuredVoltage * SIGNAL_SCALE_FACTOR;
 }
