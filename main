@@ -59,7 +59,8 @@ const char *LOG_FILE_NAME = "SOLENOID.CSV";
 
 // If true, each logged sample is also printed to the Serial Monitor.
 // Useful for debugging, but can slow things down at high sample rates.
-const bool PRINT_TO_SERIAL = true;
+// * Set to false during actual tests
+const bool PRINT_TO_SERIAL = false;
 
 // If true, the file is flushed after every sample.
 // This is safer if power is lost suddenly, but it makes logging slower.
@@ -231,9 +232,6 @@ void writeHeader()
   // Add a blank line between logging runs in case data is appended
   // to an existing file from a previous test.
   logFile.println();
-
-  // Simple session marker for readability.
-  logFile.println("=== New Session ===");
 
   // CSV column headers.
   logFile.println("time_us,raw_adc,measured_voltage_V,actual_voltage_V");
